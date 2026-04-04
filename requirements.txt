@@ -1,0 +1,5 @@
+numpy
+requests
+sounddevice
+soundfile
+faster-whisper
