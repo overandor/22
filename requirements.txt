@@ -1,5 +1,5 @@
-numpy
-requests
-sounddevice
-soundfile
-faster-whisper
+numpy>=1.26
+requests>=2.32
+sounddevice>=0.4.7
+soundfile>=0.12.1
+faster-whisper>=1.1.0
