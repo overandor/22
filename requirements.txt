@@ -3,3 +3,4 @@ requests
 sounddevice
 soundfile
 faster-whisper
+streamlit

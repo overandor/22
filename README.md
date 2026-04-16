@@ -5,12 +5,16 @@ A local, keyboard-controlled voice agent that combines:
 - structured local planning via Ollama chat JSON output
 - local text-to-speech via Piper
 - utility actions for notes, idea capture, transcript archival, and basic video clip workflows
+- optional Streamlit UI for operator-friendly workflows and demos
 
 ## Features
 
 - Push-to-record style loop (`Enter` to start, `Enter` to stop)
+- Web UI (`ui_app.py`) for non-technical users
 - Automatic transcript archival to `agent_data/transcripts/`
 - Structured JSON tool routing with a strict schema
+- Automatic local hardware selection for Whisper runtime (`cuda`/`mps`/`cpu`)
+- JSONL audit log for traceable operations (`agent_data/logs/events.jsonl`)
 - Local tools:
   - save note
   - append content/video idea
@@ -22,6 +26,7 @@ A local, keyboard-controlled voice agent that combines:
 ## Repository layout
 
 - `local_voice_agent.py` → main implementation
+- `ui_app.py` → Streamlit UI for local operations
 - `agent_data/` → notes, ideas, queue, transcripts (runtime generated)
 - `recordings/` → source media for clip tooling (runtime generated)
 - `clips/` → generated clips (runtime generated)
@@ -34,7 +39,7 @@ A local, keyboard-controlled voice agent that combines:
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install numpy requests sounddevice soundfile faster-whisper
+pip install numpy requests sounddevice soundfile faster-whisper streamlit
 ```
 
 2) Install and run local model services.
@@ -66,6 +71,18 @@ voices/en_US-amy-medium.onnx
 python local_voice_agent.py
 ```
 
+6) Optional UI mode.
+
+```bash
+streamlit run ui_app.py
+```
+
+7) Health check mode (CI / deployment validation).
+
+```bash
+python local_voice_agent.py --mode healthcheck
+```
+
 ## Configuration knobs
 
 Edit constants in `local_voice_agent.py`:
@@ -74,6 +91,46 @@ Edit constants in `local_voice_agent.py`:
 - TTS executable/voice: `PIPER_EXE`, `PIPER_VOICE`
 - audio settings: `SAMPLE_RATE`, `CHANNELS`, `DTYPE`, `BLOCKSIZE`
 - loop hygiene: `MAIN_LOOP_SLEEP_MS`, `GC_EVERY_N_CYCLES`
+
+Hardware behavior:
+- `WHISPER_DEVICE=auto` (default) will choose the best available runtime (`cuda` → `mps` → `cpu`).
+- `WHISPER_COMPUTE_TYPE=auto` (default) uses `float16` on GPU and `int8` on CPU.
+- You can force settings with environment variables, e.g.:
+
+```bash
+WHISPER_DEVICE=cpu WHISPER_COMPUTE_TYPE=int8 python local_voice_agent.py
+```
+
+## Sell-ready packaging checklist
+
+Use this list to prepare a client handoff or paid deployment:
+
+1. **Branding**
+   - Rename app title and voice persona.
+   - Replace default Piper voice with client-approved voice assets/licensing.
+2. **Operational hardening**
+   - Add health checks (Ollama, Piper, model files).
+   - Add structured logs and a rotating log policy.
+   - Add smoke tests for tool actions.
+3. **Deployment**
+   - Pin Python + dependency versions.
+   - Package with a startup script/service wrapper (systemd, Docker, or platform equivalent).
+   - Include backup/restore instructions for `agent_data/`.
+   - Gate rollouts with `--mode healthcheck` in CI/CD.
+4. **Security & privacy**
+   - Keep all data local by default.
+   - Add local role/account controls if used by multiple operators.
+5. **Commercial docs**
+   - Include statement of work (SOW), support SLA, and maintenance terms.
+   - Provide admin runbook and end-user quickstart.
+
+## Documentation bundle recommendation
+
+For production sales, include:
+- `docs/architecture.md` (runtime components and data flow)
+- `docs/operations.md` (monitoring, backup, incident steps)
+- `docs/security.md` (local data handling policy)
+- `docs/handoff.md` (installation + acceptance checklist)
 
 ## USD appraisal (full buyout, code + integration baseline)
 
