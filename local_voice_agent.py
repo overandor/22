@@ -1,3 +1,4 @@
+import argparse
 import gc
 import json
 import os
@@ -20,16 +21,16 @@ from faster_whisper import WhisperModel
 # Configuration
 # =========================
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
-OLLAMA_MODEL = "qwen3:8b"
+OLLAMA_CHAT_URL = os.getenv("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
+OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://localhost:11434/api/tags")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
-WHISPER_MODEL = "base"
-WHISPER_DEVICE = "cpu"  # "cpu" or "cuda"
-WHISPER_COMPUTE_TYPE = "int8"  # good default for CPU
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")  # "cpu" or "cuda"
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # good default for CPU
 
-PIPER_EXE = "piper"
-PIPER_VOICE = "voices/en_US-amy-medium.onnx"
+PIPER_EXE = os.getenv("PIPER_EXE", "piper")
+PIPER_VOICE = os.getenv("PIPER_VOICE", "voices/en_US-amy-medium.onnx")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -38,6 +39,8 @@ BLOCKSIZE = 1024
 
 MAIN_LOOP_SLEEP_MS = 100
 GC_EVERY_N_CYCLES = 50
+OLLAMA_CONNECT_TIMEOUT_SEC = 5
+OLLAMA_CHAT_TIMEOUT_SEC = 120
 
 DATA_DIR = Path("agent_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -104,23 +107,36 @@ def get_latest_file(directory: Path, suffixes: Optional[List[str]] = None) -> Op
 # =========================
 
 
-def check_environment() -> None:
+def check_environment(skip_tts_check: bool = False) -> None:
     problems = []
+    warnings = []
 
     try:
-        r = requests.get(OLLAMA_TAGS_URL, timeout=5)
+        r = requests.get(OLLAMA_TAGS_URL, timeout=OLLAMA_CONNECT_TIMEOUT_SEC)
         r.raise_for_status()
     except Exception as e:
         problems.append(f"Ollama not reachable at {OLLAMA_TAGS_URL}: {e}")
 
-    if shutil.which(PIPER_EXE) is None:
-        problems.append(f"Piper executable not found in PATH: {PIPER_EXE}")
+    if not skip_tts_check:
+        if shutil.which(PIPER_EXE) is None:
+            problems.append(f"Piper executable not found in PATH: {PIPER_EXE}")
 
-    if not Path(PIPER_VOICE).exists():
-        problems.append(f"Piper voice file not found: {PIPER_VOICE}")
+        if not Path(PIPER_VOICE).exists():
+            problems.append(f"Piper voice file not found: {PIPER_VOICE}")
+    else:
+        warnings.append("Skipping Piper checks (--skip-tts-check enabled).")
+
+    if not ffmpeg_exists():
+        warnings.append("ffmpeg not found; manual clip cutting will be unavailable.")
+    if not auto_editor_exists():
+        warnings.append("auto-editor not found; silence-aware auto-cut is unavailable.")
 
     if problems:
         raise RuntimeError("Environment check failed:\n- " + "\n- ".join(problems))
+    if warnings:
+        print("[env] warnings:")
+        for w in warnings:
+            print(f"- {w}")
 
 
 # =========================
@@ -356,8 +372,14 @@ def execute_tool(plan: Dict[str, Any]) -> str:
     text = str(tool_input.get("text") or "").strip()
     title = str(tool_input.get("title") or "").strip()
     description = str(tool_input.get("description") or "").strip()
-    start_sec = float(tool_input.get("start_sec") or 0.0)
-    duration_sec = float(tool_input.get("duration_sec") or 30.0)
+    def safe_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    start_sec = safe_float(tool_input.get("start_sec"), 0.0)
+    duration_sec = safe_float(tool_input.get("duration_sec"), 30.0)
 
     if tool == "save_note":
         return save_note(text or title or description)
@@ -480,7 +502,7 @@ def call_ollama_structured(user_text: str) -> Dict[str, Any]:
         "options": {"temperature": 0.2},
     }
 
-    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
+    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=OLLAMA_CHAT_TIMEOUT_SEC)
     response.raise_for_status()
     data = response.json()
 
@@ -598,8 +620,19 @@ def run_cycle(recorder: AudioRecorder, transcriber: LocalTranscriber) -> None:
             pass
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the local voice + content agent.")
+    parser.add_argument(
+        "--skip-tts-check",
+        action="store_true",
+        help="Skip Piper binary/voice startup checks (agent will still try TTS at runtime).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    check_environment()
+    args = parse_args()
+    check_environment(skip_tts_check=args.skip_tts_check)
 
     recorder = AudioRecorder()
     transcriber = LocalTranscriber()

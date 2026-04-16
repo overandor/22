@@ -28,13 +28,13 @@ A local, keyboard-controlled voice agent that combines:
 
 ## Onboarding (quick start)
 
-1) Install Python dependencies.
+1) Install Python dependencies (Python 3.10+ recommended).
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install numpy requests sounddevice soundfile faster-whisper
+pip install -r requirements.txt
 ```
 
 2) Install and run local model services.
@@ -66,6 +66,12 @@ voices/en_US-amy-medium.onnx
 python local_voice_agent.py
 ```
 
+Optional: if you want to run without Piper configured yet, use:
+
+```bash
+python local_voice_agent.py --skip-tts-check
+```
+
 ## Configuration knobs
 
 Edit constants in `local_voice_agent.py`:
@@ -74,6 +80,11 @@ Edit constants in `local_voice_agent.py`:
 - TTS executable/voice: `PIPER_EXE`, `PIPER_VOICE`
 - audio settings: `SAMPLE_RATE`, `CHANNELS`, `DTYPE`, `BLOCKSIZE`
 - loop hygiene: `MAIN_LOOP_SLEEP_MS`, `GC_EVERY_N_CYCLES`
+
+Environment variable overrides are also supported for:
+- `OLLAMA_CHAT_URL`, `OLLAMA_TAGS_URL`, `OLLAMA_MODEL`
+- `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`
+- `PIPER_EXE`, `PIPER_VOICE`
 
 ## USD appraisal (full buyout, code + integration baseline)
 
