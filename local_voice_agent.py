@@ -1,20 +1,24 @@
 import gc
+import argparse
+import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import wave
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import requests
-import sounddevice as sd
-import soundfile as sf
-from faster_whisper import WhisperModel
+
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 
 # =========================
 # Configuration
@@ -25,8 +29,8 @@ OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
 OLLAMA_MODEL = "qwen3:8b"
 
 WHISPER_MODEL = "base"
-WHISPER_DEVICE = "cpu"  # "cpu" or "cuda"
-WHISPER_COMPUTE_TYPE = "int8"  # good default for CPU
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")  # "auto", "cpu", "cuda", or "mps"
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")  # "auto", "int8", "float16", etc.
 
 PIPER_EXE = "piper"
 PIPER_VOICE = "voices/en_US-amy-medium.onnx"
@@ -41,6 +45,9 @@ GC_EVERY_N_CYCLES = 50
 
 DATA_DIR = Path("agent_data")
 DATA_DIR.mkdir(exist_ok=True)
+LOGS_DIR = DATA_DIR / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+EVENTS_LOG_FILE = LOGS_DIR / "events.jsonl"
 
 NOTES_FILE = DATA_DIR / "notes.txt"
 IDEAS_FILE = DATA_DIR / "video_ideas.txt"
@@ -54,6 +61,31 @@ RECORDINGS_DIR.mkdir(exist_ok=True)
 
 CLIPS_DIR = Path("clips")
 CLIPS_DIR.mkdir(exist_ok=True)
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    ollama_chat_url: str
+    ollama_tags_url: str
+    ollama_model: str
+    whisper_model: str
+    whisper_device: str
+    whisper_compute_type: str
+    piper_exe: str
+    piper_voice: str
+
+
+def get_config() -> AgentConfig:
+    return AgentConfig(
+        ollama_chat_url=OLLAMA_CHAT_URL,
+        ollama_tags_url=OLLAMA_TAGS_URL,
+        ollama_model=OLLAMA_MODEL,
+        whisper_model=WHISPER_MODEL,
+        whisper_device=WHISPER_DEVICE,
+        whisper_compute_type=WHISPER_COMPUTE_TYPE,
+        piper_exe=PIPER_EXE,
+        piper_voice=PIPER_VOICE,
+    )
 
 
 # =========================
@@ -74,8 +106,11 @@ def safe_append_line(path: Path, text: str) -> None:
 def load_json_file(path: Path, default):
     if not path.exists():
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return default
 
 
 def save_json_file(path: Path, data) -> None:
@@ -99,28 +134,131 @@ def get_latest_file(directory: Path, suffixes: Optional[List[str]] = None) -> Op
     return max(files, key=lambda p: p.stat().st_mtime)
 
 
+def short_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def log_event(event_type: str, payload: Dict[str, Any]) -> None:
+    event = {
+        "ts": now_ts(),
+        "event_type": event_type,
+        "payload": payload,
+    }
+    safe_append_line(EVENTS_LOG_FILE, json.dumps(event, ensure_ascii=False))
+
+
+def require_sounddevice():
+    try:
+        import sounddevice as sd  # type: ignore
+
+        return sd
+    except Exception as e:
+        raise RuntimeError(f"sounddevice dependency unavailable: {e}") from e
+
+
+def require_soundfile():
+    try:
+        import soundfile as sf  # type: ignore
+
+        return sf
+    except Exception as e:
+        raise RuntimeError(f"soundfile dependency unavailable: {e}") from e
+
+
+def require_whisper_model():
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+
+        return WhisperModel
+    except Exception as e:
+        raise RuntimeError(f"faster-whisper dependency unavailable: {e}") from e
+
+
+def detect_whisper_runtime() -> Dict[str, str]:
+    """
+    Select the best available Whisper runtime based on local hardware.
+    Respects explicit WHISPER_DEVICE / WHISPER_COMPUTE_TYPE values when not set to 'auto'.
+    """
+    configured_device = WHISPER_DEVICE.strip().lower()
+    configured_compute = WHISPER_COMPUTE_TYPE.strip().lower()
+
+    if configured_device != "auto":
+        device = configured_device
+    else:
+        device = "cpu"
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+        except Exception:
+            device = "cpu"
+
+    if configured_compute != "auto":
+        compute_type = configured_compute
+    elif device == "cuda":
+        compute_type = "float16"
+    else:
+        compute_type = "int8"
+
+    return {"device": device, "compute_type": compute_type}
+
+
+def get_system_profile() -> Dict[str, Any]:
+    runtime = detect_whisper_runtime()
+    profile: Dict[str, Any] = {
+        "platform": platform.platform(),
+        "cpu_count": os.cpu_count() or 1,
+        "whisper_device": runtime["device"],
+        "whisper_compute_type": runtime["compute_type"],
+    }
+    return profile
+
+
 # =========================
 # Environment checks
 # =========================
 
 
 def check_environment() -> None:
+    cfg = get_config()
     problems = []
 
     try:
-        r = requests.get(OLLAMA_TAGS_URL, timeout=5)
+        r = requests.get(cfg.ollama_tags_url, timeout=5)
         r.raise_for_status()
     except Exception as e:
-        problems.append(f"Ollama not reachable at {OLLAMA_TAGS_URL}: {e}")
+        problems.append(f"Ollama not reachable at {cfg.ollama_tags_url}: {e}")
 
-    if shutil.which(PIPER_EXE) is None:
-        problems.append(f"Piper executable not found in PATH: {PIPER_EXE}")
+    if shutil.which(cfg.piper_exe) is None:
+        problems.append(f"Piper executable not found in PATH: {cfg.piper_exe}")
 
-    if not Path(PIPER_VOICE).exists():
-        problems.append(f"Piper voice file not found: {PIPER_VOICE}")
+    if not Path(cfg.piper_voice).exists():
+        problems.append(f"Piper voice file not found: {cfg.piper_voice}")
 
     if problems:
         raise RuntimeError("Environment check failed:\n- " + "\n- ".join(problems))
+
+
+def environment_report() -> Dict[str, Any]:
+    cfg = get_config()
+    problems: List[str] = []
+    try:
+        requests.get(cfg.ollama_tags_url, timeout=5).raise_for_status()
+    except Exception as e:
+        problems.append(f"Ollama: {e}")
+    if shutil.which(cfg.piper_exe) is None:
+        problems.append(f"Piper executable not found: {cfg.piper_exe}")
+    if not Path(cfg.piper_voice).exists():
+        problems.append(f"Piper voice file not found: {cfg.piper_voice}")
+
+    return {
+        "ok": len(problems) == 0,
+        "problems": problems,
+        "system_profile": get_system_profile(),
+    }
 
 
 # =========================
@@ -142,6 +280,7 @@ class AudioRecorder:
         self.blocksize = blocksize
 
     def record_until_enter(self) -> np.ndarray:
+        sd = require_sounddevice()
         print("Recording... press Enter to stop.")
         frames: List[np.ndarray] = []
         stop_flag = {"stop": False}
@@ -185,11 +324,18 @@ class AudioRecorder:
 
 class LocalTranscriber:
     def __init__(self):
-        print("[init] loading faster-whisper model...")
+        WhisperModel = require_whisper_model()
+        cfg = get_config()
+        runtime = detect_whisper_runtime()
+        self.device = runtime["device"]
+        self.compute_type = runtime["compute_type"]
+        print(
+            f"[init] loading faster-whisper model (device={self.device}, compute={self.compute_type})..."
+        )
         self.model = WhisperModel(
-            WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE,
+            cfg.whisper_model,
+            device=self.device,
+            compute_type=self.compute_type,
         )
 
     def transcribe(self, wav_path: str) -> str:
@@ -356,8 +502,14 @@ def execute_tool(plan: Dict[str, Any]) -> str:
     text = str(tool_input.get("text") or "").strip()
     title = str(tool_input.get("title") or "").strip()
     description = str(tool_input.get("description") or "").strip()
-    start_sec = float(tool_input.get("start_sec") or 0.0)
-    duration_sec = float(tool_input.get("duration_sec") or 30.0)
+    try:
+        start_sec = float(tool_input.get("start_sec") or 0.0)
+    except (TypeError, ValueError):
+        start_sec = 0.0
+    try:
+        duration_sec = float(tool_input.get("duration_sec") or 30.0)
+    except (TypeError, ValueError):
+        duration_sec = 30.0
 
     if tool == "save_note":
         return save_note(text or title or description)
@@ -469,8 +621,9 @@ def extract_json_block(text: str) -> Dict[str, Any]:
 
 
 def call_ollama_structured(user_text: str) -> Dict[str, Any]:
+    cfg = get_config()
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": cfg.ollama_model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text},
@@ -480,9 +633,19 @@ def call_ollama_structured(user_text: str) -> Dict[str, Any]:
         "options": {"temperature": 0.2},
     }
 
-    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
-    response.raise_for_status()
-    data = response.json()
+    data = None
+    last_error: Optional[Exception] = None
+    for _attempt in range(2):
+        try:
+            response = requests.post(cfg.ollama_chat_url, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            break
+        except requests.RequestException as e:
+            last_error = e
+            time.sleep(0.4)
+    if data is None:
+        raise requests.RequestException(f"Ollama request failed after retry: {last_error}")
 
     content = data["message"]["content"]
     parsed = extract_json_block(content)
@@ -505,6 +668,9 @@ def call_ollama_structured(user_text: str) -> Dict[str, Any]:
 
 
 def speak_with_piper(text: str) -> None:
+    cfg = get_config()
+    sf = require_soundfile()
+    sd = require_sounddevice()
     text = text.strip()
     if not text:
         return
@@ -515,9 +681,9 @@ def speak_with_piper(text: str) -> None:
     try:
         subprocess.run(
             [
-                PIPER_EXE,
+                cfg.piper_exe,
                 "--model",
-                PIPER_VOICE,
+                cfg.piper_voice,
                 "--output_file",
                 wav_path,
             ],
@@ -548,6 +714,41 @@ def speak_with_piper(text: str) -> None:
 # =========================
 
 
+def process_transcript(transcript: str, speak_reply: bool = True) -> Dict[str, Any]:
+    transcript = (transcript or "").strip()
+    if not transcript:
+        raise ValueError("Transcript is empty.")
+
+    started = time.time()
+    archive_msg = archive_transcript(transcript, prefix="live")
+    plan = call_ollama_structured(transcript)
+    tool_result = execute_tool(plan)
+    reply = plan.get("assistant_reply", "").strip() or "Done."
+    final_reply = f"{reply} {tool_result}".strip() if tool_result != "No tool executed." else reply
+
+    if speak_reply:
+        speak_with_piper(final_reply)
+
+    result = {
+        "transcript": transcript,
+        "archive_message": archive_msg,
+        "plan": plan,
+        "tool_result": tool_result,
+        "reply": final_reply,
+        "latency_sec": round(time.time() - started, 3),
+    }
+    log_event(
+        "transcript_processed",
+        {
+            "tool": plan.get("tool", "answer_only"),
+            "latency_sec": result["latency_sec"],
+            "transcript_hash": short_text_hash(transcript),
+            "transcript_len": len(transcript),
+        },
+    )
+    return result
+
+
 def run_cycle(recorder: AudioRecorder, transcriber: LocalTranscriber) -> None:
     audio = recorder.record_until_enter()
 
@@ -569,23 +770,14 @@ def run_cycle(recorder: AudioRecorder, transcriber: LocalTranscriber) -> None:
             print("[warn] Empty transcript.")
             return
 
-        archive_msg = archive_transcript(transcript, prefix="live")
-        print(f"[archive] {archive_msg}")
-
         print("[llm] Thinking locally...")
-        plan = call_ollama_structured(transcript)
-
+        result = process_transcript(transcript, speak_reply=False)
+        print(f"[archive] {result['archive_message']}")
         print("[plan]")
-        print(json.dumps(plan, indent=2, ensure_ascii=False))
-
-        tool_result = execute_tool(plan)
-        print(f"[tool] {tool_result}")
-
-        reply = plan.get("assistant_reply", "").strip() or "Done."
-        final_reply = f"{reply} {tool_result}".strip() if tool_result != "No tool executed." else reply
-
-        print(f"[agent] {final_reply}")
-        speak_with_piper(final_reply)
+        print(json.dumps(result["plan"], indent=2, ensure_ascii=False))
+        print(f"[tool] {result['tool_result']}")
+        print(f"[agent] {result['reply']}")
+        speak_with_piper(result["reply"])
 
     except requests.RequestException as e:
         print(f"[error] Ollama request failed: {e}")
@@ -598,7 +790,7 @@ def run_cycle(recorder: AudioRecorder, transcriber: LocalTranscriber) -> None:
             pass
 
 
-def main() -> None:
+def run_cli() -> None:
     check_environment()
 
     recorder = AudioRecorder()
@@ -622,6 +814,26 @@ def main() -> None:
             gc.collect()
 
         time.sleep(MAIN_LOOP_SLEEP_MS / 1000)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Local Voice + Content Agent")
+    parser.add_argument(
+        "--mode",
+        choices=["cli", "healthcheck"],
+        default="cli",
+        help="Run interactive CLI loop or print environment health report.",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "healthcheck":
+        report = environment_report()
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        if not report["ok"]:
+            raise SystemExit(1)
+        return
+
+    run_cli()
 
 
 if __name__ == "__main__":
